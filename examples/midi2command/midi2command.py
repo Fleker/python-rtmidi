@@ -31,6 +31,12 @@ import time
 
 from os.path import exists
 
+try:
+    from functools import lru_cache
+except ImportError:
+    # Python < 3.2
+    lru_cache = lambda func: func
+
 import yaml
 
 import rtmidi
@@ -39,6 +45,12 @@ from rtmidi.midiconstants import *
 
 
 log = logging.getLogger('midi2command')
+BACKEND_MAP = {
+    'alsa': rtmidi.API_LINUX_ALSA,
+    'jack': rtmidi.API_UNIX_JACK,
+    'coremidi': rtmidi.API_MACOSX_CORE,
+    'windowsmm': rtmidi.API_WINDOWS_MM
+}
 STATUS_MAP = {
     'noteon': NOTE_ON,
     'noteoff': NOTE_OFF,
@@ -77,7 +89,6 @@ class MidiInputHandler(object):
     def __call__(self, event, data=None):
         event, deltatime = event
         self._wallclock += deltatime
-        log.debug("[%s] @%0.6f %r", self.port, self._wallclock, event)
 
         if event[0] < 0xF0:
             channel = (event[0] & 0xF) + 1
@@ -94,31 +105,33 @@ class MidiInputHandler(object):
         if num_bytes >= 3:
             data2 = event[2]
 
+        log.debug("[%s] @%i CH:%2s %02X %s %s", self.port, self._wallclock,
+            channel or '-', status, data1, data2 or '')
+
         # Look for matching command definitions
-        # XXX: use memoize cache here
-        if status in self.commands:
-            for cmd in self.commands[status]:
-                if channel is not None and cmd.channel != channel:
-                    continue
+        cmd = self.lookup_command(status, channel, data1, data2)
 
-                found = False
-                if num_bytes == 1 or cmd.data is None:
-                    found = True
-                elif isinstance(cmd.data, int) and cmd.data == data1:
-                    found = True
-                elif (isinstance(cmd.data, (list, tuple)) and
-                        cmd.data[0] == data1 and cmd.data[1] == data2):
-                    found = True
+        if cmd:
+            cmdline = cmd.command % dict(
+                channel=channel,
+                data1=data1,
+                data2=data2,
+                status=status)
+            self.do_command(cmdline)
 
-                if found:
-                    cmdline = cmd.command % dict(
-                        channel=channel,
-                        data1=data1,
-                        data2=data2,
-                        status=status)
-                    self.do_command(cmdline)
-            else:
-                return
+    @lru_cache()
+    def lookup_command(self, status, channel, data1, data2):
+        for cmd in self.commands.get(status, []):
+            if channel is not None and cmd.channel != channel:
+                continue
+
+            if (data1 is None and data2 is None) or cmd.data is None:
+                return cmd
+            elif isinstance(cmd.data, int) and cmd.data == data1:
+                return cmd
+            elif (isinstance(cmd.data, (list, tuple)) and
+                    cmd.data[0] == data1 and cmd.data[1] == data2):
+                return cmd
 
     def do_command(self, cmdline):
         log.info("Calling external command: %s", cmdline)
@@ -167,10 +180,13 @@ def main(args=None):
 
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('-p',  '--port', dest='port',
+    parser.add_argument('-b',  '--backend',
+        choices=sorted(BACKEND_MAP),
+        help='MIDI backend API (default: OS dependant)')
+    parser.add_argument('-p',  '--port',
         help='MIDI input port name or number (default: open virtual input)')
-    parser.add_argument('-v',  '--verbose', action="store_true",
-        help='verbose output')
+    parser.add_argument('-v',  '--verbose',
+        action="store_true", help='verbose output')
     parser.add_argument(dest='config', metavar="CONFIG",
         help='Configuration file in YAML syntax.')
 
@@ -180,9 +196,13 @@ def main(args=None):
         level=logging.DEBUG if args.verbose else logging.WARNING)
 
     try:
-        midiin, port_name = open_midiport(args.port, use_virtual=True)
+        midiin, port_name = open_midiport(args.port, use_virtual=True,
+            api=BACKEND_MAP.get(args.backend, rtmidi.API_UNSPECIFIED),
+            client_name='midi2command', port_name='MIDI input')
+    except (IOError, ValueError) as exc:
+        return "Could not open MIDI input: %s" % exc
     except (EOFError, KeyboardInterrupt):
-        sys.exit()
+        return
 
     log.debug("Attaching MIDI input callback handler.")
     midiin.set_callback(MidiInputHandler(port_name, args.config))
